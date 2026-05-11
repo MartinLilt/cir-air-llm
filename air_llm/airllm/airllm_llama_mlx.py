@@ -262,7 +262,8 @@ class AirLLMLlamaMlx:
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, test_nonlayered=False, show_memory_util=False,
-                 delete_original=False, reuse_modules=True, compile_block=False):
+                 delete_original=False, reuse_modules=True, compile_block=False,
+                 streaming=None):
 
         self.hf_token = hf_token
         self.set_layer_names_dict()
@@ -274,6 +275,13 @@ class AirLLMLlamaMlx:
         # and just .update() weights into it per layer. Skips ~66 Python instantiations per
         # 3-token gen on a 22-layer model. See projects/kir-airllm/03-real-numbers.
         self.reuse_modules = reuse_modules and not test_nonlayered
+        self._compression = compression
+        # streaming=None: auto-decide based on model size vs available memory.
+        # streaming=True: classic AirLLM — read weights from disk every token.
+        # streaming=False: AirLLM-Lite fast path — preload all weights once,
+        # never touch disk during generation. Requires whole model fits in RAM.
+        # Fast-path edge-case combos fall back to streaming for safety.
+        self._streaming_arg = streaming
 
 
 
@@ -297,8 +305,23 @@ class AirLLMLlamaMlx:
 
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
+        # Decide streaming vs fast-path. Fast-path requires (a) reuse_modules
+        # (the persistent-module path; test_nonlayered and the per-token-
+        # instantiate path are streaming-only) and (b) model fits in memory.
+        self.streaming = self._decide_streaming(compression, self._streaming_arg,
+                                                compile_block)
+
         if self.reuse_modules:
-            self._block = TransformerBlock(args=self.model_args)
+            if self.streaming:
+                # One block; weights swapped per-layer via .update().
+                self._block = TransformerBlock(args=self.model_args)
+                self._blocks = None
+            else:
+                # N blocks; each holds its own layer's weights for the whole
+                # generation. No .update() in the gen loop, no disk reads.
+                self._block = None
+                self._blocks = [TransformerBlock(args=self.model_args)
+                                for _ in range(self.model_args.n_layers)]
             self._embed = nn.Embedding(self.model_args.vocab_size, self.model_args.dim)
             self._norm_mod = RMSNorm(self.model_args.dim, eps=self.model_args.norm_eps)
             self._output_mod = nn.Linear(self.model_args.dim, self.model_args.vocab_size, bias=False)
@@ -309,7 +332,11 @@ class AirLLMLlamaMlx:
             # construct QuantizedEmbedding / QuantizedLinear directly. Real
             # weights arrive later via .update() in model_generate().
             if compression == '4bit':
-                nn.quantize(self._block, bits=4, group_size=64)
+                if self.streaming:
+                    nn.quantize(self._block, bits=4, group_size=64)
+                else:
+                    for b in self._blocks:
+                        nn.quantize(b, bits=4, group_size=64)
                 self._embed = nn.QuantizedEmbedding(
                     self.model_args.vocab_size, self.model_args.dim,
                     group_size=64, bits=4,
@@ -318,6 +345,11 @@ class AirLLMLlamaMlx:
                     self.model_args.dim, self.model_args.vocab_size,
                     bias=False, group_size=64, bits=4,
                 )
+
+            # Fast-path: load every shard once. After this generation never
+            # touches disk again — the persister is bypassed in model_generate.
+            if not self.streaming:
+                self._preload_all_weights()
 
         # mx.compile a *pure functional* block forward (block_forward_fn). Weights
         # are passed as explicit args, so the compiled graph doesn't capture stale
@@ -348,6 +380,64 @@ class AirLLMLlamaMlx:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+
+    def _estimate_model_bytes(self, compression):
+        """Estimated total weight bytes (post-compression). For sizing fast-path."""
+        a = self.model_args
+        bpp = 0.5 if compression == '4bit' else 2  # fp16 default
+        # 4bit adds ~6% overhead for scales packed alongside weights.
+        overhead = 1.06 if compression == '4bit' else 1.0
+        # Per-layer: attn (wq, wk, wv, wo) + ffn (w1, w2, w3) + 2 RMSNorm
+        attn = 2 * a.dim * a.dim + 2 * a.dim * (a.n_kv_heads * a.head_dim)
+        ffn = 3 * a.dim * a.hidden_dim
+        per_layer = (attn + ffn) * bpp * overhead + 4 * a.dim
+        embed = a.vocab_size * a.dim * bpp * overhead
+        lmhead = embed
+        final_norm = 2 * a.dim
+        return a.n_layers * per_layer + embed + lmhead + final_norm
+
+    def _decide_streaming(self, compression, streaming_arg, compile_block):
+        """Streaming if (a) edge-case combos require it, (b) user forced it,
+        or (c) auto: model doesn't fit in 60% of currently-available memory."""
+        # Fast-path requires the persistent-module setup. test_nonlayered and
+        # the per-token-instantiate path don't have it.
+        if not self.reuse_modules:
+            return True
+        # Compile path closes over self._block weight refs; fast-path uses
+        # self._blocks[i] instead. Keep them mutually exclusive for now.
+        if compile_block:
+            return True
+        if streaming_arg is True:
+            return True
+        if streaming_arg is False:
+            return False
+        est = self._estimate_model_bytes(compression)
+        available = psutil.virtual_memory().available
+        fits = est < 0.6 * available
+        if self.show_memory_util:
+            print(f"[streaming auto-decide] model≈{est/1e9:.2f}GB, "
+                  f"available={available/1e9:.2f}GB → "
+                  f"{'fast-path' if fits else 'streaming'}")
+        return not fits
+
+    def _preload_all_weights(self):
+        """Fill self._embed / self._blocks[i] / self._norm_mod / self._output_mod
+        from disk once. After this the persister is unused during generation."""
+        persister = ModelPersister.get_model_persister()
+        self._embed.update(persister.load_model(
+            self.layer_names_dict['embed'], self.checkpoint_path)['tok_embeddings'])
+        for i in tqdm(range(self.model_args.n_layers), desc='preloading layers'):
+            self._blocks[i].update(persister.load_model(
+                f'{self.layer_names_dict["layer_prefix"]}.{i}',
+                self.checkpoint_path)['layers'][i])
+        self._norm_mod.update(persister.load_model(
+            self.layer_names_dict['norm'], self.checkpoint_path)['norm'])
+        self._output_mod.update(persister.load_model(
+            self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
+        # Force materialization so first-token latency reflects compute alone,
+        # not lazy weight loads carried over from this preload.
+        mx.eval([m.parameters() for m in
+                 [self._embed, self._norm_mod, self._output_mod] + self._blocks])
 
     def _call_compiled_block(self, x, use_causal_mask, cache):
         """Extract current weights from self._block and invoke the compiled functional forward."""
@@ -401,10 +491,12 @@ class AirLLMLlamaMlx:
         mask = mask.astype(embed_mod.weight.dtype)
 
         self.record_memory('before_loading_tok')
-        update_weights = ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)
-
-        self.record_memory('after_loading_tok')
-        embed_mod.update(update_weights['tok_embeddings'])
+        if self.streaming:
+            update_weights = ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)
+            self.record_memory('after_loading_tok')
+            embed_mod.update(update_weights['tok_embeddings'])
+        else:
+            self.record_memory('after_loading_tok')
 
         x = embed_mod(x)
         # force execution
@@ -422,21 +514,29 @@ class AirLLMLlamaMlx:
 
         for il in tqdm(range(self.model_args.n_layers), desc='running layers'):
             self.record_memory(f'before layer {il}')
-            if self.reuse_modules:
+            if not self.streaming:
+                l = self._blocks[il]
+            elif self.reuse_modules:
                 l = self._block
+                l.update(
+                    ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
+                                                                         self.checkpoint_path)['layers'][il]
+                )
             else:
                 l = TransformerBlock(args=self.model_args)
-            l.update(
-                ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
-                                                                     self.checkpoint_path)['layers'][il]
-            )
+                l.update(
+                    ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
+                                                                         self.checkpoint_path)['layers'][il]
+                )
 
             if self.compile_block:
                 x, c = self._call_compiled_block(x, use_causal_mask=True, cache=None)
             else:
                 x, c = l(x, mask=mask)
-            # force execution
-            mx.eval(x)
+            # Skip per-layer mx.eval: keeping the graph lazy across all 32
+            # layers lets MLX overlap the next layer's load_model() (Python
+            # work) with the current layer's GPU compute. Profiling showed
+            # 92% of time was compute-bound — sync per layer was wasted.
             # We store the per layer cache in a simple python list
             cache.append(c)
 
@@ -452,9 +552,10 @@ class AirLLMLlamaMlx:
             norm_mod = self._norm_mod
         else:
             norm_mod = RMSNorm(self.model_args.dim, eps=self.model_args.norm_eps)
-        norm_mod.update(
-            ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm']
-        )
+        if self.streaming:
+            norm_mod.update(
+                ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm']
+            )
         x = norm_mod(x)
         # force execution
         mx.eval(x)
@@ -471,12 +572,17 @@ class AirLLMLlamaMlx:
             output_mod = self._output_mod
         else:
             output_mod = nn.Linear(self.model_args.dim, self.model_args.vocab_size, bias=False)
-        output_mod.update(
-            ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output']
-        )
+        if self.streaming:
+            output_mod.update(
+                ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output']
+            )
         y = output_mod(x[:, -1])
-        # force execution
-        mx.eval(y)
+        # Drain y AND the per-layer KV cache. Without per-layer mx.eval the
+        # cache list holds lazy graph nodes that still ref intermediate layer
+        # weights; evaluating only y leaves cache unmaterialized until the
+        # gen loop forces it later, by which time those weights would need
+        # to be re-walked through a deeper graph.
+        mx.eval(y, cache)
 
         if self.test_nonlayered:
             self.output = output_mod
@@ -507,8 +613,9 @@ class AirLLMLlamaMlx:
             self.record_memory('before_tok_embeddings')
             if self.reuse_modules:
                 embed_mod = self._embed
-                embed_mod.update(
-                    ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)['tok_embeddings'])
+                if self.streaming:
+                    embed_mod.update(
+                        ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)['tok_embeddings'])
             elif self.test_nonlayered:
                 embed_mod = self.tok_embeddings
             else:
@@ -527,7 +634,9 @@ class AirLLMLlamaMlx:
             for i in tqdm(range(len(cache)), desc='running layers'):
                 self.record_memory(f'before layer {i}')
 
-                if self.reuse_modules:
+                if not self.streaming:
+                    l = self._blocks[i]
+                elif self.reuse_modules:
                     l = self._block
                     l.update(ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{i}',
                                                                              self.checkpoint_path)['layers'][i])
@@ -542,8 +651,7 @@ class AirLLMLlamaMlx:
                     x, cache[i] = self._call_compiled_block(x, use_causal_mask=False, cache=cache[i])
                 else:
                     x, cache[i] = l(x, mask=None, cache=cache[i])
-                # force execution
-                mx.eval(x)
+                # No per-layer mx.eval — see prompt-pass loop above for why.
                 if not self.test_nonlayered and not self.reuse_modules:
                     del l
                     gc.collect()
@@ -552,7 +660,8 @@ class AirLLMLlamaMlx:
             self.record_memory('before_norm')
             if self.reuse_modules:
                 norm_mod = self._norm_mod
-                norm_mod.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm'])
+                if self.streaming:
+                    norm_mod.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm'])
             elif self.test_nonlayered:
                 norm_mod = self.norm
             else:
@@ -570,7 +679,8 @@ class AirLLMLlamaMlx:
 
             if self.reuse_modules:
                 output_mod = self._output_mod
-                output_mod.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
+                if self.streaming:
+                    output_mod.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
             elif self.test_nonlayered:
                 output_mod = self.output
             else:
@@ -578,8 +688,10 @@ class AirLLMLlamaMlx:
                 output_mod.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
             y = sample(output_mod(x[:, -1]))
 
-            # force execution
-            mx.eval(y)
+            # Drain y AND cache — see prompt-pass for rationale. Each
+            # cache[i] was updated in-place under a lazy graph; without
+            # this they'd accumulate across gen tokens.
+            mx.eval(y, cache)
             if not self.test_nonlayered and not self.reuse_modules:
                 del output_mod
                 gc.collect()
